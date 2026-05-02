@@ -377,3 +377,6 @@ tags
 # CLion directories
 /.idea/
 /cmake-build-*
+
+/developer_guide*.md
+/deps
