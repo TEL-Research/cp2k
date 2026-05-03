@@ -20,6 +20,7 @@ MODULE cp_control_types
    USE kinds,                           ONLY: default_path_length,&
                                               default_string_length,&
                                               dp
+   USE maxwelllink_types,               ONLY: mxl_socket_control_type
    USE pair_potential_types,            ONLY: pair_potential_p_release,&
                                               pair_potential_p_type
    USE qs_cdft_types,                   ONLY: cdft_control_create,&
@@ -140,6 +141,7 @@ MODULE cp_control_types
       REAL(dp)                             :: pade_e_max = 100.0_dp
       REAL(dp)                             :: pade_fit_e_min = 0.0_dp
       REAL(dp)                             :: pade_fit_e_max = 300.0_dp
+      TYPE(mxl_socket_control_type)         :: mxl_socket
    END TYPE rtp_control_type
 
 ! **************************************************************************************************
@@ -718,6 +720,7 @@ MODULE cp_control_types
              s2_restraint_type, &
              admm_control_type, &
              maxwell_control_type, &
+             mxl_socket_control_type, &
              expot_control_type, &
              rtp_control_type, &
              sccs_control_type, &

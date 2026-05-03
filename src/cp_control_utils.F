@@ -60,6 +60,7 @@ MODULE cp_control_utils
         use_mom_ref_user, xtb_vdw_type_d3, xtb_vdw_type_d4, xtb_vdw_type_none
    USE input_cp2k_check,                ONLY: xc_functionals_expand
    USE input_cp2k_dft,                  ONLY: create_dft_section
+   USE maxwelllink_input,               ONLY: read_mxl_socket_control
    USE input_enumeration_types,         ONLY: enum_i2c,&
                                               enumeration_type
    USE input_keyword_types,             ONLY: keyword_get,&
@@ -506,6 +507,9 @@ CONTAINS
             dft_control%apply_efield = .TRUE.
             CPASSERT(nrep == 1)
          END IF
+      END IF
+      IF (do_rtp .AND. dft_control%rtp_control%mxl_socket%active) THEN
+         dft_control%apply_efield_field = .TRUE.
       END IF
 
       ! Now, can try to guess polarisation in rtp
@@ -2857,6 +2861,7 @@ CONTAINS
       dft_control%rtp_control%delta_pulse_direction = tmp
       CALL section_vals_val_get(rtp_section, "SC_CHECK_START", &
                                 i_val=dft_control%rtp_control%sc_check_start)
+      CALL read_mxl_socket_control(rtp_section, dft_control%rtp_control%mxl_socket)
       proj_mo_section => section_vals_get_subs_vals(rtp_section, "PRINT%PROJECTION_MO")
       CALL section_vals_get(proj_mo_section, explicit=is_present)
       IF (is_present) THEN

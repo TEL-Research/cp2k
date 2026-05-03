@@ -380,3 +380,5 @@ tags
 
 /developer_guide*.md
 /deps
+/AGENT*
+/try

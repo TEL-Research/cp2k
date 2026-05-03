@@ -59,6 +59,7 @@ MODULE input_cp2k_dft
                                               create_ext_vxc_section
    USE input_cp2k_field,                ONLY: create_efield_section,&
                                               create_per_efield_section
+   USE maxwelllink_input,               ONLY: create_mxl_socket_section
    USE input_cp2k_harris,               ONLY: create_harris_section
    USE input_cp2k_kpoints,              ONLY: create_kpoint_set_section,&
                                               create_kpoints_section
@@ -1542,7 +1543,7 @@ CONTAINS
       CALL section_create(section, __LOCATION__, name="REAL_TIME_PROPAGATION", &
                           description="Parameters needed to set up the real time propagation"// &
                           " for the electron dynamics. This currently works only in the NVE ensemble.", &
-                          n_keywords=4, n_subsections=4, repeats=.FALSE., &
+                          n_keywords=4, n_subsections=5, repeats=.FALSE., &
                           citations=[Kunert2003, Andermatt2016])
 
       CALL keyword_create(keyword, __LOCATION__, name="MAX_ITER", &
@@ -1788,6 +1789,11 @@ CONTAINS
                           default_r_val=0.0_dp)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
+
+      NULLIFY (subsection)
+      CALL create_mxl_socket_section(subsection)
+      CALL section_add_subsection(section, subsection)
+      CALL section_release(subsection)
 
       NULLIFY (print_section)
       CALL section_create(print_section, __LOCATION__, name="PRINT", &

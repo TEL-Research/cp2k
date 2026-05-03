@@ -128,7 +128,11 @@ CONTAINS
       c = 137.03599962875_dp
       field = 0._dp
       nu = 0.0_dp
-      nfield = SIZE(dft_control%efield_fields)
+      IF (ASSOCIATED(dft_control%efield_fields)) THEN
+         nfield = SIZE(dft_control%efield_fields)
+      ELSE
+         nfield = 0
+      END IF
       DO i = 1, nfield
          efield => dft_control%efield_fields(i)%efield
          IF (.NOT. efield%envelop_id == custom_env .AND. efield%wavelength > EPSILON(0.0_dp)) nu = c/(efield%wavelength) !in case of a custom efield we do not need nu
@@ -170,6 +174,9 @@ CONTAINS
             field = field + strength*pol(:)
          END IF
       END DO
+      IF (ASSOCIATED(dft_control%rtp_control)) THEN
+         IF (dft_control%rtp_control%mxl_socket%active) field = field + dft_control%rtp_control%field
+      END IF
 
    END SUBROUTINE make_field
 

@@ -356,6 +356,10 @@ list(
   mao_optimizer.F
   mao_wfn_analysis.F
   matrix_exp.F
+  maxwelllink_types.F
+  maxwelllink_input.F
+  maxwelllink_socket.F
+  maxwelllink.F
   maxwell_solver_interface.F
   mdctrl_types.F
   metadynamics.F
@@ -1394,6 +1398,7 @@ list(
 list(
   APPEND
   CP2K_SRCS_C
+  maxwelllink_socket.c
   sockets.c
   base/machine_cpuid.c
   base/openmp_trace.c

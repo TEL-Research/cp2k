@@ -55,6 +55,12 @@ MODULE rt_propagation
    USE kinds,                           ONLY: default_path_length,&
                                               dp
    USE machine,                         ONLY: m_walltime
+   USE maxwelllink,                     ONLY: maxwelllink_init,&
+                                              maxwelllink_receive_field,&
+                                              maxwelllink_send_source,&
+                                              maxwelllink_shutdown,&
+                                              maxwelllink_type,&
+                                              maxwelllink_validate_rtp_control
    USE md_environment_types,            ONLY: md_environment_type
    USE moments_utils,                   ONLY: get_reference_point
    USE pw_env_types,                    ONLY: pw_env_type
@@ -176,7 +182,8 @@ CONTAINS
       CALL section_vals_val_get(print_moments_section, "VEL_REPRS", l_val=vel_reprs)
 
       rtp%track_imag_density = (magnetic) .OR. (vel_reprs) .OR. (rtp_control%velocity_gauge) &
-                               .OR. (rtp%do_hfx) .OR. (.NOT. rtp_control%fixed_ions)
+                               .OR. (rtp%do_hfx) .OR. (.NOT. rtp_control%fixed_ions) &
+                               .OR. (rtp_control%mxl_socket%active)
       rtp%propagate_complex_ks = rtp%do_hfx .OR. rtp_control%velocity_gauge
 
       ! Marek : In case some print sections that apply so far only to RTBSE are present,
@@ -197,6 +204,7 @@ CONTAINS
       ! Setup the MO projection environment if required
       IF (rtp_control%is_proj_mo) CALL init_mo_projection(qs_env, rtp_control)
 
+      CALL maxwelllink_validate_rtp_control(rtp_control)
       CALL init_propagation_run(qs_env)
       IF (.NOT. rtp_control%fixed_ions) THEN
          !derivativs of the overlap needed for EMD
@@ -342,6 +350,7 @@ CONTAINS
       TYPE(rt_prop_type), POINTER                        :: rtp
       TYPE(rtp_control_type), POINTER                    :: rtp_control
       TYPE(section_vals_type), POINTER                   :: input, moments_section, rtp_section
+      TYPE(maxwelllink_type)                             :: mxl
 
       should_stop = .FALSE.
       CALL timeset(routineN, handle)
@@ -361,6 +370,7 @@ CONTAINS
       aspc_order = rtp_control%aspc_order
 
       rtp%energy_old = energy%total
+      CALL maxwelllink_init(mxl, qs_env, rtp_control, energy%total)
       time_iter_start = m_walltime()
       CALL cp_add_iter_level(logger%iter_info, "MD")
       CALL cp_iterate(logger%iter_info, iter_nr=0)
@@ -398,6 +408,8 @@ CONTAINS
          pw_env%poisson_env%parameters%dbc_params%time = qs_env%sim_time
          qs_env%sim_step = i_step
          rtp%istep = i_step - rtp%i_start
+         CALL maxwelllink_receive_field(mxl, qs_env, rtp_control, rtp%dt, should_stop)
+         IF (should_stop) EXIT
          CALL calculate_ecore_efield(qs_env, .FALSE.)
          IF (dft_control%apply_external_potential) THEN
             IF (.NOT. dft_control%expot_control%static) THEN
@@ -419,6 +431,8 @@ CONTAINS
             CALL rt_prop_output(qs_env, real_time_propagation, rtp%delta_iter)
          END DO
          IF (rtp%converged) THEN
+            CALL maxwelllink_send_source(mxl, qs_env, rtp%dt, qs_env%sim_time, energy%total, should_stop)
+            IF (should_stop) EXIT
             CALL external_control(should_stop, "MD", globenv=globenv)
             IF (should_stop) CALL cp_iterate(logger%iter_info, last=.TRUE., iter_nr=i_step)
             time_iter_stop = m_walltime()
@@ -433,7 +447,9 @@ CONTAINS
       END DO
       CALL cp_rm_iter_level(logger%iter_info, "MD")
 
-      IF (.NOT. rtp%converged) &
+      CALL maxwelllink_shutdown(mxl, qs_env)
+
+      IF (.NOT. rtp%converged .AND. .NOT. should_stop) &
          CALL cp_abort(__LOCATION__, "propagation did not converge, "// &
                        "either increase MAX_ITER or use a smaller TIMESTEP")
 
