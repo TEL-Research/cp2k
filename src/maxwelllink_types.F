@@ -18,11 +18,15 @@ MODULE maxwelllink_types
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'maxwelllink_types'
 
+   INTEGER, PARAMETER                    :: mxl_periodic_dipole_berry = 1
+   INTEGER, PARAMETER                    :: mxl_periodic_dipole_current = 2
+
    TYPE mxl_socket_control_type
       LOGICAL                              :: active = .FALSE.
       LOGICAL                              :: unix = .FALSE.
       LOGICAL                              :: reset_dipole = .FALSE.
       INTEGER                              :: molecule_id = -1
+      INTEGER                              :: periodic_dipole_method = mxl_periodic_dipole_berry
       INTEGER                              :: port = 31415
       INTEGER                              :: verbosity = 0
       CHARACTER(LEN=default_path_length)   :: host = "localhost"
@@ -30,6 +34,8 @@ MODULE maxwelllink_types
       CHARACTER(LEN=default_path_length)   :: prefix = "/tmp/socketmxl_"
    END TYPE mxl_socket_control_type
 
-   PUBLIC :: mxl_socket_control_type
+   PUBLIC :: mxl_periodic_dipole_berry,&
+             mxl_periodic_dipole_current,&
+             mxl_socket_control_type
 
 END MODULE maxwelllink_types

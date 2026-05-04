@@ -47,7 +47,9 @@ MODULE maxwelllink
                                               maxwelllink_socket_send_source,&
                                               maxwelllink_socket_shutdown,&
                                               maxwelllink_socket_type
-   USE maxwelllink_types,               ONLY: mxl_socket_control_type
+   USE maxwelllink_types,               ONLY: mxl_periodic_dipole_berry,&
+                                              mxl_periodic_dipole_current,&
+                                              mxl_socket_control_type
    USE md_ener_types,                   ONLY: md_ener_type
    USE md_energies,                     ONLY: md_energy
    USE md_environment_types,            ONLY: get_md_env,&
@@ -60,7 +62,8 @@ MODULE maxwelllink
                                               qs_environment_type
    USE qs_kind_types,                   ONLY: get_qs_kind,&
                                               qs_kind_type
-   USE qs_moments,                      ONLY: qs_moment_locop
+   USE qs_moments,                      ONLY: qs_moment_berry_phase,&
+                                              qs_moment_locop
    USE qs_neighbor_list_types,          ONLY: neighbor_list_set_p_type
    USE qs_operators_ao,                 ONLY: build_lin_mom_matrix
    USE qs_rho_types,                    ONLY: qs_rho_get,&
@@ -91,6 +94,7 @@ MODULE maxwelllink
       REAL(KIND=dp)                          :: energy_last = 0.0_dp
       INTEGER                                :: dipole_history = 0
       INTEGER                                :: current_history = 0
+      INTEGER                                :: periodic_dipole_method = mxl_periodic_dipole_berry
    END TYPE maxwelllink_type
 
    TYPE maxwelllink_ehrenfest_type
@@ -237,7 +241,7 @@ CONTAINS
       IF (rtp_control%velocity_gauge .AND. rtp_control%linear_scaling) &
          CALL cp_abort(__LOCATION__, "MXL_SOCKET periodic velocity-gauge support requires MO-based RTP.")
       IF (rtp_control%velocity_gauge .AND. rtp_control%nl_gauge_transform) &
-         CALL cp_abort(__LOCATION__, "MXL_SOCKET periodic velocity-gauge current source does not support VG_COM_NL.")
+         CALL cp_abort(__LOCATION__, "MXL_SOCKET periodic velocity-gauge support does not support VG_COM_NL.")
 
    END SUBROUTINE maxwelllink_validate_rtp_control
 
@@ -283,6 +287,7 @@ CONTAINS
       mxl%active = .TRUE.
       mxl%have_result = .FALSE.
       mxl%periodic_velocity_gauge = periodic_cell
+      mxl%periodic_dipole_method = rtp_control%mxl_socket%periodic_dipole_method
       mxl%energy_last = energy
       mxl%field_endpoint = 0.0_dp
       mxl%field_midpoint = 0.0_dp
@@ -302,14 +307,33 @@ CONTAINS
                WRITE (output_unit, FMT="(T3,A,A)") "Host: ", TRIM(socket_host)
                WRITE (output_unit, FMT="(T3,A,I0)") "Port: ", rtp_control%mxl_socket%port
             END IF
+            IF (mxl%periodic_velocity_gauge) THEN
+               SELECT CASE (rtp_control%mxl_socket%periodic_dipole_method)
+               CASE (mxl_periodic_dipole_berry)
+                  WRITE (output_unit, FMT="(T3,A)") "Periodic dipole method: Berry phase"
+               CASE (mxl_periodic_dipole_current)
+                  WRITE (output_unit, FMT="(T3,A)") "Periodic dipole method: current integration"
+               END SELECT
+            END IF
          END IF
          CALL maxwelllink_socket_connect(mxl%socket, socket_host, rtp_control%mxl_socket%port, &
                                          rtp_control%mxl_socket%unix, rtp_control%mxl_socket%verbosity)
       END IF
 
       IF (mxl%periodic_velocity_gauge) THEN
-         mxl%dipole_initial = 0.0_dp
-         mxl%dipole_last = 0.0_dp
+         SELECT CASE (rtp_control%mxl_socket%periodic_dipole_method)
+         CASE (mxl_periodic_dipole_berry)
+            IF (rtp_control%mxl_socket%reset_dipole) THEN
+               CALL maxwelllink_compute_periodic_dipole(qs_env, mxl%dipole_initial)
+            ELSE
+               mxl%dipole_initial = 0.0_dp
+            END IF
+            CALL maxwelllink_compute_periodic_dipole(qs_env, mxl%dipole_last)
+            mxl%dipole_last = mxl%dipole_last - mxl%dipole_initial
+         CASE (mxl_periodic_dipole_current)
+            mxl%dipole_initial = 0.0_dp
+            mxl%dipole_last = 0.0_dp
+         END SELECT
          CALL maxwelllink_compute_periodic_current(qs_env, mxl%current_last)
          mxl%current_history = 1
       ELSE IF (rtp_control%mxl_socket%reset_dipole) THEN
@@ -406,7 +430,7 @@ CONTAINS
    END SUBROUTINE maxwelllink_receive_field
 
 ! **************************************************************************************************
-!> \brief Sends the source-current vector for the step that just converged.
+!> \brief Sends the molecular source vector for the step that just converged.
 !> \param mxl MaxwellLink runtime state.
 !> \param qs_env Quickstep environment.
 !> \param dt Dynamics timestep in atomic units.
@@ -428,7 +452,7 @@ CONTAINS
       INTEGER                                            :: handle
       REAL(KIND=dp)                                      :: energy_field_free, kinetic_field_free, &
                                                             potential_field_free, source_time
-      REAL(KIND=dp), DIMENSION(3)                        :: current_density, dipole_abs, dipole_end, &
+      REAL(KIND=dp), DIMENSION(3)                        :: current, current_density, dipole_abs, dipole_end, &
                                                             dipole_midpoint, source
       TYPE(mp_para_env_type), POINTER                    :: para_env
 
@@ -444,24 +468,37 @@ CONTAINS
       IF (PRESENT(kinetic_energy)) kinetic_field_free = kinetic_energy
       source_time = sim_time
       IF (mxl%periodic_velocity_gauge) THEN
-         CALL maxwelllink_compute_periodic_current(qs_env, source)
-         IF (mxl%current_history >= 1) THEN
-            dipole_end(:) = mxl%dipole_last(:) + 0.5_dp*dt*(mxl%current_last(:) + source(:))
-         ELSE
-            dipole_end(:) = mxl%dipole_last(:) + dt*source(:)
-         END IF
-         dipole_abs(:) = dipole_end(:)
+         SELECT CASE (mxl%periodic_dipole_method)
+         CASE (mxl_periodic_dipole_berry)
+            CALL maxwelllink_compute_periodic_dipole(qs_env, dipole_abs)
+            dipole_end(:) = dipole_abs(:) - mxl%dipole_initial(:)
+            CALL maxwelllink_unwrap_periodic_dipole(qs_env, mxl%dipole_last, dipole_end)
+            IF (mxl%dipole_history >= 2) THEN
+               source(:) = (3.0_dp*dipole_end(:) - 4.0_dp*mxl%dipole_last(:) + mxl%dipole_before_last(:))/(2.0_dp*dt)
+            ELSE
+               source(:) = (dipole_end(:) - mxl%dipole_last(:))/dt
+            END IF
+            CALL maxwelllink_compute_periodic_current(qs_env, current)
+         CASE (mxl_periodic_dipole_current)
+            CALL maxwelllink_compute_periodic_current(qs_env, current)
+            source(:) = current(:)
+            IF (mxl%current_history >= 1) THEN
+               dipole_end(:) = mxl%dipole_last(:) + 0.5_dp*dt*(mxl%current_last(:) + current(:))
+            ELSE
+               dipole_end(:) = mxl%dipole_last(:) + dt*current(:)
+            END IF
+         END SELECT
          dipole_midpoint(:) = 0.5_dp*(dipole_end(:) + mxl%dipole_last(:))
          potential_field_free = energy
          energy_field_free = potential_field_free + kinetic_field_free
          IF (mxl%cell_volume > 0.0_dp) THEN
-            current_density(:) = source(:)/mxl%cell_volume
+            current_density(:) = current(:)/mxl%cell_volume
          ELSE
             current_density(:) = 0.0_dp
          END IF
          CALL maxwelllink_build_json_periodic(source_time, energy_field_free, kinetic_field_free, &
                                               potential_field_free, dipole_end, dipole_midpoint, source, &
-                                              current_density, mxl%field_midpoint, mxl%vector_potential, &
+                                              current, current_density, mxl%field_midpoint, mxl%vector_potential, &
                                               extra_json)
       ELSE
          CALL maxwelllink_compute_dipole(qs_env, dipole_abs)
@@ -492,7 +529,7 @@ CONTAINS
       mxl%dipole_last = dipole_end
       mxl%dipole_history = MIN(mxl%dipole_history + 1, 2)
       IF (mxl%periodic_velocity_gauge) THEN
-         mxl%current_last = source
+         mxl%current_last = current
          mxl%current_history = 1
       END IF
       mxl%energy_last = energy_field_free
@@ -544,6 +581,50 @@ CONTAINS
       CALL get_results(results=results, description=description, values=dipole)
 
    END SUBROUTINE maxwelllink_compute_dipole
+
+! **************************************************************************************************
+!> \brief Computes the periodic Berry-phase dipole moment in atomic units.
+!> \param qs_env Quickstep environment.
+!> \param dipole Dipole moment in atomic units, modulo cell polarization quanta.
+! **************************************************************************************************
+   SUBROUTINE maxwelllink_compute_periodic_dipole(qs_env, dipole)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      REAL(KIND=dp), DIMENSION(3), INTENT(OUT)           :: dipole
+
+      CHARACTER(LEN=default_string_length), PARAMETER    :: description = "[DIPOLE]"
+      REAL(KIND=dp), DIMENSION(:), POINTER               :: ref_point
+      TYPE(cp_result_type), POINTER                      :: results
+
+      NULLIFY (ref_point, results)
+      CALL qs_moment_berry_phase(qs_env, magnetic=.FALSE., nmoments=1, &
+                                 reference=use_mom_ref_zero, ref_point=ref_point, unit_number=-1)
+      CALL get_qs_env(qs_env, results=results)
+      IF (.NOT. test_for_result(results=results, description=description)) &
+         CALL cp_abort(__LOCATION__, "Failed to compute MaxwellLink periodic Berry-phase dipole source.")
+      CALL get_results(results=results, description=description, values=dipole)
+
+   END SUBROUTINE maxwelllink_compute_periodic_dipole
+
+! **************************************************************************************************
+!> \brief Unwraps a periodic Berry-phase dipole to the nearest branch to the previous value.
+!> \param qs_env Quickstep environment.
+!> \param previous Previous unwrapped dipole in atomic units.
+!> \param dipole Dipole to unwrap in atomic units.
+! **************************************************************************************************
+   SUBROUTINE maxwelllink_unwrap_periodic_dipole(qs_env, previous, dipole)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      REAL(KIND=dp), DIMENSION(3), INTENT(IN)            :: previous
+      REAL(KIND=dp), DIMENSION(3), INTENT(INOUT)         :: dipole
+
+      REAL(KIND=dp), DIMENSION(3)                        :: branch
+      TYPE(cell_type), POINTER                           :: cell
+
+      NULLIFY (cell)
+      CALL get_qs_env(qs_env, cell=cell)
+      branch(:) = ANINT(MATMUL(cell%h_inv, dipole(:) - previous(:)))
+      dipole(:) = dipole(:) - MATMUL(cell%hmat, branch(:))
+
+   END SUBROUTINE maxwelllink_unwrap_periodic_dipole
 
 ! **************************************************************************************************
 !> \brief Computes the integrated periodic velocity-gauge current in atomic units.
@@ -701,26 +782,28 @@ CONTAINS
 !> \param energy Total energy in Hartree.
 !> \param kinetic_energy Kinetic energy in Hartree.
 !> \param potential_energy Potential/electronic energy in Hartree.
-!> \param dipole Effective current-integrated dipole in atomic units.
-!> \param dipole_m Midpoint effective dipole in atomic units.
-!> \param current Integrated current, i.e. d mu_eff / dt, in atomic units.
+!> \param dipole Periodic endpoint dipole in atomic units.
+!> \param dipole_m Periodic midpoint dipole in atomic units.
+!> \param source Dipole time derivative sent on the socket, in atomic units.
+!> \param current Integrated current expectation value in atomic units.
 !> \param current_density Integrated current divided by cell volume.
 !> \param field_midpoint MaxwellLink midpoint electric field.
 !> \param vector_potential MaxwellLink physical endpoint vector potential.
 !> \param extra_json JSON string.
 ! **************************************************************************************************
    SUBROUTINE maxwelllink_build_json_periodic(time, energy, kinetic_energy, potential_energy, dipole, &
-                                              dipole_m, current, current_density, field_midpoint, &
+                                              dipole_m, source, current, current_density, field_midpoint, &
                                               vector_potential, extra_json)
       REAL(KIND=dp), INTENT(IN)                          :: time, energy, kinetic_energy, potential_energy
       REAL(KIND=dp), DIMENSION(3), INTENT(IN)            :: current, current_density, dipole, dipole_m, &
-                                                            field_midpoint, vector_potential
+                                                            field_midpoint, source, vector_potential
       CHARACTER(LEN=*), INTENT(OUT)                      :: extra_json
 
       WRITE (extra_json, '(A,ES24.16,A,ES24.16,A,ES24.16,A,ES24.16,A,ES24.16,A,ES24.16,'// &
                           'A,ES24.16,A,ES24.16,A,ES24.16,A,ES24.16,A,ES24.16,A,ES24.16,'// &
                           'A,ES24.16,A,ES24.16,A,ES24.16,A,ES24.16,A,ES24.16,A,ES24.16,'// &
-                          'A,ES24.16,A,ES24.16,A,ES24.16,A,ES24.16,A)') &
+                          'A,ES24.16,A,ES24.16,A,ES24.16,A,ES24.16,A,ES24.16,A,ES24.16,'// &
+                          'A,ES24.16,A)') &
          '{"time_au":', time, &
          ',"mux_au":', dipole(1), &
          ',"muy_au":', dipole(2), &
@@ -731,6 +814,9 @@ CONTAINS
          ',"energy_au":', energy, &
          ',"energy_kin_au":', kinetic_energy, &
          ',"energy_pot_au":', potential_energy, &
+         ',"dmux_dt_au":', source(1), &
+         ',"dmuy_dt_au":', source(2), &
+         ',"dmuz_dt_au":', source(3), &
          ',"jx_au":', current(1), &
          ',"jy_au":', current(2), &
          ',"jz_au":', current(3), &

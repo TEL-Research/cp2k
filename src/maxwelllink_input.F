@@ -20,7 +20,10 @@ MODULE maxwelllink_input
                                               section_vals_type,&
                                               section_vals_val_get
    USE input_val_types,                 ONLY: lchar_t
-   USE maxwelllink_types,               ONLY: mxl_socket_control_type
+   USE maxwelllink_types,               ONLY: mxl_periodic_dipole_berry,&
+                                              mxl_periodic_dipole_current,&
+                                              mxl_socket_control_type
+   USE string_utilities,                ONLY: s2a
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -48,8 +51,8 @@ CONTAINS
       CALL section_create(section, __LOCATION__, name="MXL_SOCKET", &
                           description="Couples time-dependent dynamics to MaxwellLink through a socket. "// &
                           "For real-time TDDFT this receives a uniform electric field in atomic units and "// &
-                          "returns the molecular source current d(mu)/dt in atomic units.", &
-                          n_keywords=8, n_subsections=0, repeats=.FALSE.)
+                          "returns the molecular source vector d(mu)/dt in atomic units.", &
+                          n_keywords=9, n_subsections=0, repeats=.FALSE.)
 
       CALL keyword_create(keyword, __LOCATION__, name="HOST", &
                           description="Host name for TCP sockets. If UNIX is true and FILE is empty, this is "// &
@@ -91,8 +94,22 @@ CONTAINS
 
       CALL keyword_create(keyword, __LOCATION__, name="RESET_DIPOLE", &
                           description="Subtract the initial dipole from diagnostic dipoles returned to MaxwellLink. "// &
-                          "The returned source current is unchanged apart from roundoff.", &
+                          "The returned source vector is unchanged apart from roundoff.", &
                           usage="RESET_DIPOLE", default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="PERIODIC_DIPOLE_METHOD", &
+                          description="Method used to construct the periodic velocity-gauge dipole returned to "// &
+                          "MaxwellLink. BERRY computes the dipole directly from CP2K's Berry-phase periodic "// &
+                          "moment routine and finite-differences it for the socket source. CURRENT restores the "// &
+                          "older, cheaper path: compute the endpoint current directly and numerically integrate "// &
+                          "it to obtain the reported dipole.", &
+                          usage="PERIODIC_DIPOLE_METHOD BERRY", default_i_val=mxl_periodic_dipole_berry, &
+                          enum_c_vals=s2a("BERRY", "CURRENT"), &
+                          enum_i_vals=[mxl_periodic_dipole_berry, mxl_periodic_dipole_current], &
+                          enum_desc=s2a("Direct Berry-phase periodic dipole, with branch unwrapping", &
+                                        "Direct endpoint current, integrated to an effective dipole"))
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
@@ -128,6 +145,7 @@ CONTAINS
       CALL section_vals_val_get(subsection, "PREFIX", c_val=control%prefix)
       CALL section_vals_val_get(subsection, "MOLECULE_ID", i_val=control%molecule_id)
       CALL section_vals_val_get(subsection, "RESET_DIPOLE", l_val=control%reset_dipole)
+      CALL section_vals_val_get(subsection, "PERIODIC_DIPOLE_METHOD", i_val=control%periodic_dipole_method)
       CALL section_vals_val_get(subsection, "VERBOSITY", i_val=control%verbosity)
 
    END SUBROUTINE read_mxl_socket_control
