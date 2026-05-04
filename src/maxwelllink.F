@@ -44,10 +44,12 @@ MODULE maxwelllink
       LOGICAL                                :: active = .FALSE.
       LOGICAL                                :: have_result = .FALSE.
       REAL(KIND=dp), DIMENSION(3)            :: dipole_initial = 0.0_dp
+      REAL(KIND=dp), DIMENSION(3)            :: dipole_before_last = 0.0_dp
       REAL(KIND=dp), DIMENSION(3)            :: dipole_last = 0.0_dp
       REAL(KIND=dp), DIMENSION(3)            :: field_endpoint = 0.0_dp
       REAL(KIND=dp), DIMENSION(3)            :: field_midpoint = 0.0_dp
       REAL(KIND=dp)                          :: energy_last = 0.0_dp
+      INTEGER                                :: dipole_history = 0
    END TYPE maxwelllink_type
 
    PUBLIC :: maxwelllink_type,&
@@ -68,8 +70,6 @@ CONTAINS
 
       IF (.NOT. rtp_control%mxl_socket%active) RETURN
 
-      IF (.NOT. rtp_control%fixed_ions) &
-         CALL cp_abort(__LOCATION__, "MXL_SOCKET is currently implemented only for fixed-ion RT-TDDFT.")
       IF (rtp_control%velocity_gauge) &
          CALL cp_abort(__LOCATION__, "MXL_SOCKET currently supports only non-periodic length-gauge RT-TDDFT.")
       IF (rtp_control%propagator /= do_em) &
@@ -82,7 +82,7 @@ CONTAINS
 !> \param mxl MaxwellLink runtime state.
 !> \param qs_env Quickstep environment.
 !> \param rtp_control RTP control settings.
-!> \param energy Initial total energy.
+!> \param energy Initial CP2K potential/electronic energy.
 ! **************************************************************************************************
    SUBROUTINE maxwelllink_init(mxl, qs_env, rtp_control, energy)
       TYPE(maxwelllink_type), INTENT(INOUT)              :: mxl
@@ -106,8 +106,6 @@ CONTAINS
 
       NULLIFY (cell, para_env)
       CALL get_qs_env(qs_env, cell=cell, para_env=para_env)
-      IF (.NOT. rtp_control%fixed_ions) &
-         CALL cp_abort(__LOCATION__, "MXL_SOCKET is currently implemented only for fixed-ion RT-TDDFT.")
       IF (rtp_control%velocity_gauge) &
          CALL cp_abort(__LOCATION__, "MXL_SOCKET currently supports only non-periodic length-gauge RT-TDDFT.")
       IF (ANY(cell%perd(1:3) /= 0)) &
@@ -144,6 +142,8 @@ CONTAINS
       END IF
       CALL maxwelllink_compute_dipole(qs_env, mxl%dipole_last)
       mxl%dipole_last = mxl%dipole_last - mxl%dipole_initial
+      mxl%dipole_before_last = mxl%dipole_last
+      mxl%dipole_history = 1
 
       CALL timestop(handle)
 
@@ -226,21 +226,24 @@ CONTAINS
 !> \param qs_env Quickstep environment.
 !> \param dt Dynamics timestep in atomic units.
 !> \param sim_time Current simulation time in atomic units.
-!> \param energy Current total energy.
+!> \param energy Current CP2K potential/electronic energy, including field coupling.
 !> \param stop MaxwellLink requested termination.
+!> \param kinetic_energy Optional nuclear kinetic energy for Ehrenfest dynamics.
 ! **************************************************************************************************
-   SUBROUTINE maxwelllink_send_source(mxl, qs_env, dt, sim_time, energy, stop)
+   SUBROUTINE maxwelllink_send_source(mxl, qs_env, dt, sim_time, energy, stop, kinetic_energy)
       TYPE(maxwelllink_type), INTENT(INOUT)              :: mxl
       TYPE(qs_environment_type), POINTER                 :: qs_env
       REAL(KIND=dp), INTENT(IN)                          :: dt, sim_time, energy
       LOGICAL, INTENT(OUT)                               :: stop
+      REAL(KIND=dp), INTENT(IN), OPTIONAL                :: kinetic_energy
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'maxwelllink_send_source'
 
       CHARACTER(LEN=max_line_length)                     :: extra_json
       INTEGER                                            :: handle
-      REAL(KIND=dp)                                      :: energy_field_free, source_time
-      REAL(KIND=dp), DIMENSION(3)                        :: dipole_abs, dipole_end, dipole_json, source
+      REAL(KIND=dp)                                      :: energy_field_free, kinetic_field_free, &
+                                                            potential_field_free, source_time
+      REAL(KIND=dp), DIMENSION(3)                        :: dipole_abs, dipole_end, dipole_midpoint, source
       TYPE(mp_para_env_type), POINTER                    :: para_env
 
       CALL timeset(routineN, handle)
@@ -253,11 +256,19 @@ CONTAINS
 
       CALL maxwelllink_compute_dipole(qs_env, dipole_abs)
       dipole_end = dipole_abs - mxl%dipole_initial
-      source(:) = (dipole_end(:) - mxl%dipole_last(:))/dt
-      dipole_json(:) = dipole_end(:)
+      IF (mxl%dipole_history >= 2) THEN
+         source(:) = (3.0_dp*dipole_end(:) - 4.0_dp*mxl%dipole_last(:) + mxl%dipole_before_last(:))/(2.0_dp*dt)
+      ELSE
+         source(:) = (dipole_end(:) - mxl%dipole_last(:))/dt
+      END IF
+      dipole_midpoint(:) = 0.5_dp*(dipole_end(:) + mxl%dipole_last(:))
       source_time = sim_time
-      energy_field_free = energy + DOT_PRODUCT(dipole_abs, mxl%field_endpoint)
-      CALL maxwelllink_build_json(source_time, energy_field_free, dipole_json, dipole_end, extra_json)
+      kinetic_field_free = 0.0_dp
+      IF (PRESENT(kinetic_energy)) kinetic_field_free = kinetic_energy
+      potential_field_free = energy + DOT_PRODUCT(dipole_abs, mxl%field_endpoint)
+      energy_field_free = potential_field_free + kinetic_field_free
+      CALL maxwelllink_build_json(source_time, energy_field_free, kinetic_field_free, &
+                                  potential_field_free, dipole_end, dipole_midpoint, extra_json)
 
       NULLIFY (para_env)
       CALL get_qs_env(qs_env, para_env=para_env)
@@ -269,7 +280,9 @@ CONTAINS
       CALL para_env%bcast(stop)
 
       mxl%have_result = .FALSE.
+      mxl%dipole_before_last = mxl%dipole_last
       mxl%dipole_last = dipole_end
+      mxl%dipole_history = MIN(mxl%dipole_history + 1, 2)
       mxl%energy_last = energy_field_free
 
       CALL timestop(handle)
@@ -324,16 +337,16 @@ CONTAINS
 !> \brief Builds compact MaxwellLink JSON metadata.
 !> \param time Current density time in atomic units.
 !> \param energy Total energy in Hartree.
+!> \param kinetic_energy Kinetic energy in Hartree.
+!> \param potential_energy Field-free potential/electronic energy in Hartree.
 !> \param dipole Dipole reported as mux_au/muy_au/muz_au in atomic units.
 !> \param dipole_m Current-density dipole reported as mux_m_au/muy_m_au/muz_m_au.
 !> \param extra_json JSON string.
 ! **************************************************************************************************
-   SUBROUTINE maxwelllink_build_json(time, energy, dipole, dipole_m, extra_json)
-      REAL(KIND=dp), INTENT(IN)                          :: time, energy
+   SUBROUTINE maxwelllink_build_json(time, energy, kinetic_energy, potential_energy, dipole, dipole_m, extra_json)
+      REAL(KIND=dp), INTENT(IN)                          :: time, energy, kinetic_energy, potential_energy
       REAL(KIND=dp), DIMENSION(3), INTENT(IN)            :: dipole, dipole_m
       CHARACTER(LEN=*), INTENT(OUT)                      :: extra_json
-
-      REAL(KIND=dp), PARAMETER                           :: zero = 0.0_dp
 
       WRITE (extra_json, '(A,ES24.16,A,ES24.16,A,ES24.16,A,ES24.16,A,ES24.16,A,ES24.16,'// &
                          'A,ES24.16,A,ES24.16,A,ES24.16,A,ES24.16,A)') &
@@ -345,8 +358,8 @@ CONTAINS
          ',"muy_m_au":', dipole_m(2), &
          ',"muz_m_au":', dipole_m(3), &
          ',"energy_au":', energy, &
-         ',"energy_kin_au":', zero, &
-         ',"energy_pot_au":', energy, &
+         ',"energy_kin_au":', kinetic_energy, &
+         ',"energy_pot_au":', potential_energy, &
          '}'
 
    END SUBROUTINE maxwelllink_build_json

@@ -27,6 +27,7 @@ MODULE md_run
                                               cp_print_key_should_output,&
                                               cp_print_key_unit_nr,&
                                               cp_rm_iter_level
+   USE cp_control_types,                ONLY: dft_control_type
    USE cp_subsys_types,                 ONLY: cp_subsys_get,&
                                               cp_subsys_type
    USE distribution_1d_types,           ONLY: distribution_1d_type
@@ -40,7 +41,7 @@ MODULE md_run
    USE input_constants,                 ONLY: &
         ehrenfest, langevin_ensemble, npe_f_ensemble, npe_i_ensemble, &
         nph_uniaxial_damped_ensemble, nph_uniaxial_ensemble, npt_f_ensemble, npt_i_ensemble, &
-        npt_ia_ensemble, reftraj_ensemble
+        npt_ia_ensemble, nve_ensemble, reftraj_ensemble
    USE input_cp2k_check,                ONLY: remove_restart_info
    USE input_section_types,             ONLY: section_vals_get_subs_vals,&
                                               section_vals_remove_values,&
@@ -49,6 +50,11 @@ MODULE md_run
    USE kinds,                           ONLY: default_string_length,&
                                               dp
    USE machine,                         ONLY: m_walltime
+   USE maxwelllink,                     ONLY: maxwelllink_init,&
+                                              maxwelllink_receive_field,&
+                                              maxwelllink_send_source,&
+                                              maxwelllink_shutdown,&
+                                              maxwelllink_type
    USE md_ener_types,                   ONLY: create_md_ener,&
                                               md_ener_type
    USE md_energies,                     ONLY: initialize_md_ener,&
@@ -77,6 +83,7 @@ MODULE md_run
    USE metadynamics_types,              ONLY: set_meta_env
    USE particle_list_types,             ONLY: particle_list_type
    USE qs_environment_methods,          ONLY: qs_env_time_update
+   USE qs_environment_types,            ONLY: get_qs_env
    USE reftraj_types,                   ONLY: create_reftraj,&
                                               reftraj_type
    USE reftraj_util,                    ONLY: initialize_reftraj,&
@@ -186,7 +193,8 @@ CONTAINS
       INTEGER                                            :: handle, i, istep, md_stride, run_type_id
       INTEGER, POINTER                                   :: itimes
       LOGICAL                                            :: check, ehrenfest_md, save_mem, &
-                                                            should_stop, write_binary_restart_file
+                                                            md_energy_current, should_stop, &
+                                                            write_binary_restart_file
       REAL(KIND=dp)                                      :: dummy, time_iter_start, time_iter_stop
       REAL(KIND=dp), POINTER                             :: constant, time, used_time
       TYPE(atomic_kind_list_type), POINTER               :: atomic_kinds
@@ -194,9 +202,11 @@ CONTAINS
       TYPE(cell_type), POINTER                           :: cell
       TYPE(cp_logger_type), POINTER                      :: logger
       TYPE(cp_subsys_type), POINTER                      :: subsys, subsys_i
+      TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(distribution_1d_type), POINTER                :: local_particles
       TYPE(free_energy_type), POINTER                    :: fe_env
       TYPE(md_ener_type), POINTER                        :: md_ener
+      TYPE(maxwelllink_type)                             :: mxl
       TYPE(mp_para_env_type), POINTER                    :: para_env
       TYPE(particle_list_type), POINTER                  :: particles
       TYPE(reftraj_type), POINTER                        :: reftraj
@@ -211,11 +221,13 @@ CONTAINS
       CPASSERT(ASSOCIATED(globenv))
       CPASSERT(ASSOCIATED(force_env))
 
+      should_stop = .FALSE.
+      md_energy_current = .FALSE.
       NULLIFY (particles, cell, simpar, itimes, used_time, subsys, &
                md_ener, thermostats, barostat, reftraj, force_env_section, &
                reftraj_section, work_section, atomic_kinds, &
                local_particles, time, fe_env, free_energy_section, &
-               constraint_section, thermal_regions, virial, subsys_i)
+               constraint_section, thermal_regions, virial, subsys_i, dft_control)
       logger => cp_get_default_logger()
       para_env => force_env%para_env
 
@@ -273,6 +285,11 @@ CONTAINS
       !If requested set up the REFTRAJ run
       IF (simpar%ensemble == reftraj_ensemble .AND. ehrenfest_md) &
          CPABORT("Ehrenfest MD does not support reftraj ensemble ")
+      IF (ehrenfest_md) THEN
+         CALL get_qs_env(force_env%qs_env, dft_control=dft_control)
+         IF (dft_control%rtp_control%mxl_socket%active .AND. simpar%ensemble /= nve_ensemble) &
+            CPABORT("MaxwellLink Ehrenfest coupling currently supports only the NVE ensemble.")
+      END IF
       IF (simpar%ensemble == reftraj_ensemble) THEN
          reftraj_section => section_vals_get_subs_vals(md_section, "REFTRAJ")
          ALLOCATE (reftraj)
@@ -422,6 +439,10 @@ CONTAINS
                               virial, force_env%para_env)
 
          CALL md_energy(md_env, md_ener)
+         IF (ehrenfest_md) THEN
+            CALL get_qs_env(force_env%qs_env, dft_control=dft_control)
+            CALL maxwelllink_init(mxl, force_env%qs_env, dft_control%rtp_control, md_ener%epot)
+         END IF
          CALL md_write_output(md_env) !inits the print env at itimes == 0 also writes trajectories
          md_stride = 1
       ELSE
@@ -463,6 +484,15 @@ CONTAINS
          ELSE
             CALL cp_iterate(logger%iter_info, last=.TRUE., iter_nr=itimes)
          END IF
+         md_energy_current = .FALSE.
+         IF (ehrenfest_md .AND. mxl%active) THEN
+            CALL maxwelllink_receive_field(mxl, force_env%qs_env, dft_control%rtp_control, &
+                                           force_env%qs_env%rtp%dt, should_stop)
+            IF (should_stop) THEN
+               CALL cp_iterate(logger%iter_info, last=.TRUE., iter_nr=itimes)
+               EXIT
+            END IF
+         END IF
 
          ! Open possible Shake output units
          simpar%info_constraint = cp_print_key_unit_nr(logger, constraint_section, "CONSTRAINT_INFO", &
@@ -485,8 +515,16 @@ CONTAINS
          CALL cp_print_key_finished_output(simpar%lagrange_multipliers, logger, &
                                            constraint_section, "LAGRANGE_MULTIPLIERS")
 
+         IF (ehrenfest_md .AND. mxl%active) THEN
+            CALL md_energy(md_env, md_ener)
+            md_energy_current = .TRUE.
+            CALL maxwelllink_send_source(mxl, force_env%qs_env, force_env%qs_env%rtp%dt, &
+                                         force_env%qs_env%sim_time, md_ener%epot, should_stop, &
+                                         kinetic_energy=md_ener%ekin)
+         END IF
+
          ! Free Energy calculation
-         CALL free_energy_evaluate(md_env, should_stop, free_energy_section)
+         IF (.NOT. should_stop) CALL free_energy_evaluate(md_env, should_stop, free_energy_section)
 
          IF (should_stop) EXIT
 
@@ -522,7 +560,7 @@ CONTAINS
          END IF
 
          IF (simpar%ensemble /= reftraj_ensemble) THEN
-            CALL md_energy(md_env, md_ener)
+            IF (.NOT. md_energy_current) CALL md_energy(md_env, md_ener)
             CALL temperature_control(simpar, md_env, md_ener, force_env, logger)
             CALL comvel_control(md_ener, force_env, md_section, logger)
             CALL angvel_control(md_ener, force_env, md_section, logger)
@@ -545,6 +583,8 @@ CONTAINS
 
       ! Remove the iteration level
       CALL cp_rm_iter_level(logger%iter_info, "MD")
+
+      IF (ehrenfest_md) CALL maxwelllink_shutdown(mxl, force_env%qs_env)
 
       ! Clean up PLUMED
       IF (ASSOCIATED(force_env%meta_env)) THEN
