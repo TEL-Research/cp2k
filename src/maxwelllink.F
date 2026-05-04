@@ -10,12 +10,15 @@
 ! **************************************************************************************************
 MODULE maxwelllink
    USE cell_types,                      ONLY: cell_type
-   USE cp_control_types,                ONLY: rtp_control_type
+   USE cp_control_types,                ONLY: dft_control_type,&
+                                              rtp_control_type
+   USE force_env_types,                 ONLY: force_env_type
    USE cp_log_handling,                 ONLY: cp_logger_get_default_io_unit
    USE cp_result_methods,               ONLY: get_results,&
                                               test_for_result
    USE cp_result_types,                 ONLY: cp_result_type
    USE input_constants,                 ONLY: do_em,&
+                                              nve_ensemble,&
                                               use_mom_ref_zero
    USE kinds,                           ONLY: default_path_length,&
                                               default_string_length,&
@@ -27,6 +30,10 @@ MODULE maxwelllink
                                               maxwelllink_socket_shutdown,&
                                               maxwelllink_socket_type
    USE maxwelllink_types,               ONLY: mxl_socket_control_type
+   USE md_ener_types,                   ONLY: md_ener_type
+   USE md_energies,                     ONLY: md_energy
+   USE md_environment_types,            ONLY: get_md_env,&
+                                              md_environment_type
    USE message_passing,                 ONLY: mp_para_env_type
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
@@ -52,7 +59,18 @@ MODULE maxwelllink
       INTEGER                                :: dipole_history = 0
    END TYPE maxwelllink_type
 
+   TYPE maxwelllink_ehrenfest_type
+      TYPE(maxwelllink_type)                  :: link
+      TYPE(dft_control_type), POINTER         :: dft_control => NULL()
+   END TYPE maxwelllink_ehrenfest_type
+
    PUBLIC :: maxwelllink_type,&
+             maxwelllink_ehrenfest_type,&
+             maxwelllink_ehrenfest_init,&
+             maxwelllink_ehrenfest_receive_field,&
+             maxwelllink_ehrenfest_send_source,&
+             maxwelllink_ehrenfest_shutdown,&
+             maxwelllink_ehrenfest_validate,&
              maxwelllink_init,&
              maxwelllink_receive_field,&
              maxwelllink_send_source,&
@@ -60,6 +78,118 @@ MODULE maxwelllink
              maxwelllink_validate_rtp_control
 
 CONTAINS
+
+! **************************************************************************************************
+!> \brief Caches MaxwellLink RTP control for Ehrenfest MD hooks.
+!> \param mxl MaxwellLink Ehrenfest runtime state.
+!> \param force_env Force environment.
+! **************************************************************************************************
+   SUBROUTINE maxwelllink_ehrenfest_attach(mxl, force_env)
+      TYPE(maxwelllink_ehrenfest_type), INTENT(INOUT)    :: mxl
+      TYPE(force_env_type), POINTER                      :: force_env
+
+      IF (.NOT. ASSOCIATED(mxl%dft_control)) &
+         CALL get_qs_env(force_env%qs_env, dft_control=mxl%dft_control)
+
+   END SUBROUTINE maxwelllink_ehrenfest_attach
+
+! **************************************************************************************************
+!> \brief Validates MaxwellLink settings for Ehrenfest MD.
+!> \param mxl MaxwellLink Ehrenfest runtime state.
+!> \param force_env Force environment.
+!> \param ensemble MD ensemble.
+! **************************************************************************************************
+   SUBROUTINE maxwelllink_ehrenfest_validate(mxl, force_env, ensemble)
+      TYPE(maxwelllink_ehrenfest_type), INTENT(INOUT)    :: mxl
+      TYPE(force_env_type), POINTER                      :: force_env
+      INTEGER, INTENT(IN)                                :: ensemble
+
+      CALL maxwelllink_ehrenfest_attach(mxl, force_env)
+      IF (mxl%dft_control%rtp_control%mxl_socket%active .AND. ensemble /= nve_ensemble) &
+         CPABORT("MaxwellLink Ehrenfest coupling currently supports only the NVE ensemble.")
+
+   END SUBROUTINE maxwelllink_ehrenfest_validate
+
+! **************************************************************************************************
+!> \brief Initializes MaxwellLink coupling for Ehrenfest MD.
+!> \param mxl MaxwellLink Ehrenfest runtime state.
+!> \param force_env Force environment.
+!> \param potential_energy Initial CP2K potential/electronic energy.
+! **************************************************************************************************
+   SUBROUTINE maxwelllink_ehrenfest_init(mxl, force_env, potential_energy)
+      TYPE(maxwelllink_ehrenfest_type), INTENT(INOUT)    :: mxl
+      TYPE(force_env_type), POINTER                      :: force_env
+      REAL(KIND=dp), INTENT(IN)                          :: potential_energy
+
+      CALL maxwelllink_ehrenfest_attach(mxl, force_env)
+      CALL maxwelllink_init(mxl%link, force_env%qs_env, mxl%dft_control%rtp_control, potential_energy)
+
+   END SUBROUTINE maxwelllink_ehrenfest_init
+
+! **************************************************************************************************
+!> \brief Receives and installs the MaxwellLink field before an Ehrenfest MD step.
+!> \param mxl MaxwellLink Ehrenfest runtime state.
+!> \param force_env Force environment.
+!> \param stop MaxwellLink requested termination.
+! **************************************************************************************************
+   SUBROUTINE maxwelllink_ehrenfest_receive_field(mxl, force_env, stop)
+      TYPE(maxwelllink_ehrenfest_type), INTENT(INOUT)    :: mxl
+      TYPE(force_env_type), POINTER                      :: force_env
+      LOGICAL, INTENT(OUT)                               :: stop
+
+      stop = .FALSE.
+      IF (.NOT. mxl%link%active) RETURN
+
+      CALL maxwelllink_ehrenfest_attach(mxl, force_env)
+      CALL maxwelllink_receive_field(mxl%link, force_env%qs_env, mxl%dft_control%rtp_control, &
+                                     force_env%qs_env%rtp%dt, stop)
+
+   END SUBROUTINE maxwelllink_ehrenfest_receive_field
+
+! **************************************************************************************************
+!> \brief Sends the MaxwellLink source after a converged Ehrenfest MD step.
+!> \param mxl MaxwellLink Ehrenfest runtime state.
+!> \param md_env MD environment.
+!> \param force_env Force environment.
+!> \param stop MaxwellLink requested termination.
+!> \param energy_current Whether md_ener was refreshed in this call.
+! **************************************************************************************************
+   SUBROUTINE maxwelllink_ehrenfest_send_source(mxl, md_env, force_env, stop, energy_current)
+      TYPE(maxwelllink_ehrenfest_type), INTENT(INOUT)    :: mxl
+      TYPE(md_environment_type), POINTER                 :: md_env
+      TYPE(force_env_type), POINTER                      :: force_env
+      LOGICAL, INTENT(OUT)                               :: stop
+      LOGICAL, INTENT(OUT), OPTIONAL                     :: energy_current
+
+      TYPE(md_ener_type), POINTER                        :: md_ener
+
+      stop = .FALSE.
+      IF (PRESENT(energy_current)) energy_current = .FALSE.
+      IF (.NOT. mxl%link%active) RETURN
+
+      NULLIFY (md_ener)
+      CALL get_md_env(md_env, md_ener=md_ener)
+      CALL md_energy(md_env, md_ener)
+      IF (PRESENT(energy_current)) energy_current = .TRUE.
+      CALL maxwelllink_send_source(mxl%link, force_env%qs_env, force_env%qs_env%rtp%dt, &
+                                   force_env%qs_env%sim_time, md_ener%epot, stop, &
+                                   kinetic_energy=md_ener%ekin)
+
+   END SUBROUTINE maxwelllink_ehrenfest_send_source
+
+! **************************************************************************************************
+!> \brief Shuts down MaxwellLink coupling for Ehrenfest MD.
+!> \param mxl MaxwellLink Ehrenfest runtime state.
+!> \param force_env Force environment.
+! **************************************************************************************************
+   SUBROUTINE maxwelllink_ehrenfest_shutdown(mxl, force_env)
+      TYPE(maxwelllink_ehrenfest_type), INTENT(INOUT)    :: mxl
+      TYPE(force_env_type), POINTER                      :: force_env
+
+      CALL maxwelllink_shutdown(mxl%link, force_env%qs_env)
+      NULLIFY (mxl%dft_control)
+
+   END SUBROUTINE maxwelllink_ehrenfest_shutdown
 
 ! **************************************************************************************************
 !> \brief Validates RT-TDDFT control settings for MaxwellLink coupling.
