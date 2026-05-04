@@ -509,7 +509,9 @@ CONTAINS
          END IF
       END IF
       IF (do_rtp .AND. dft_control%rtp_control%mxl_socket%active) THEN
-         dft_control%apply_efield_field = .TRUE.
+         IF (.NOT. dft_control%rtp_control%velocity_gauge) THEN
+            dft_control%apply_efield_field = .TRUE.
+         END IF
       END IF
 
       ! Now, can try to guess polarisation in rtp
