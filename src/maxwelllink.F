@@ -36,8 +36,7 @@ MODULE maxwelllink
    USE cp_result_methods,               ONLY: get_results,&
                                               test_for_result
    USE cp_result_types,                 ONLY: cp_result_type
-   USE input_constants,                 ONLY: do_em,&
-                                              nve_ensemble,&
+   USE input_constants,                 ONLY: nve_ensemble,&
                                               use_mom_ref_zero
    USE kinds,                           ONLY: default_path_length,&
                                               default_string_length,&
@@ -235,8 +234,6 @@ CONTAINS
 
       IF (.NOT. rtp_control%mxl_socket%active) RETURN
 
-      IF (rtp_control%propagator /= do_em) &
-         CALL cp_abort(__LOCATION__, "MXL_SOCKET requires REAL_TIME_PROPAGATION%PROPAGATOR EM.")
       IF (rtp_control%velocity_gauge .AND. rtp_control%linear_scaling) &
          CALL cp_abort(__LOCATION__, "MXL_SOCKET periodic velocity-gauge support requires MO-based RTP.")
       IF (rtp_control%velocity_gauge .AND. rtp_control%nl_gauge_transform) &
@@ -280,8 +277,6 @@ CONTAINS
          CALL cp_abort(__LOCATION__, "MXL_SOCKET periodic RT-TDDFT requires REAL_TIME_PROPAGATION%VELOCITY_GAUGE.")
       IF ((.NOT. periodic_cell) .AND. rtp_control%velocity_gauge) &
          CALL cp_abort(__LOCATION__, "MXL_SOCKET velocity-gauge support is currently restricted to periodic cells.")
-      IF (rtp_control%propagator /= do_em) &
-         CALL cp_abort(__LOCATION__, "MXL_SOCKET requires REAL_TIME_PROPAGATION%PROPAGATOR EM.")
       IF (periodic_cell .AND. ASSOCIATED(dft_control%efield_fields)) &
          CALL cp_abort(__LOCATION__, "MXL_SOCKET periodic velocity-gauge mode cannot be combined with DFT%EFIELD.")
 
